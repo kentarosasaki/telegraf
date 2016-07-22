@@ -29,25 +29,29 @@ var timeFormats = map[string]string{
 	"ts-httpd":       "02/Jan/2006:15:04:05 -0700",
 	"ts-epoch":       "EPOCH",
 	"ts-epochnano":   "EPOCH_NANO",
+	"ts":             "TIMESTAMP", // try parsing all known timestamp layouts.
 }
 
 const (
-	INT      = "int"
-	TAG      = "tag"
-	FLOAT    = "float"
-	STRING   = "string"
-	DURATION = "duration"
-	DROP     = "drop"
+	INT        = "int"
+	TAG        = "tag"
+	FLOAT      = "float"
+	STRING     = "string"
+	DURATION   = "duration"
+	DROP       = "drop"
+	EPOCH      = "EPOCH"
+	EPOCH_NANO = "EPOCH_NANO"
+	TIMESTAMP  = "TIMESTAMP"
 )
 
 var (
-	// matches named captures that contain a type.
+	// matches named captures that contain a modifier.
 	//   ie,
 	//     %{NUMBER:bytes:int}
 	//     %{IPORHOST:clientip:tag}
 	//     %{HTTPDATE:ts1:ts-http}
 	//     %{HTTPDATE:ts2:ts-"02 Jan 06 15:04"}
-	typedRe = regexp.MustCompile(`%{\w+:(\w+):(ts-".+"|t?s?-?\w+)}`)
+	modifierRe = regexp.MustCompile(`%{\w+:(\w+):(ts-".+"|t?s?-?\w+)}`)
 	// matches a plain pattern name. ie, %{NUMBER}
 	patternOnlyRe = regexp.MustCompile(`%{(\w+)}`)
 )
@@ -140,6 +144,7 @@ func (p *Parser) Compile() error {
 
 func (p *Parser) ParseLine(line string) (telegraf.Metric, error) {
 	var err error
+	// values are the parsed fields from the log line
 	var values map[string]string
 	// the matching pattern string
 	var patternName string
@@ -165,6 +170,7 @@ func (p *Parser) ParseLine(line string) (telegraf.Metric, error) {
 			continue
 		}
 
+		// t is the modifier of the field
 		var t string
 		// check if pattern has some modifiers
 		if types, ok := p.typeMap[patternName]; ok {
@@ -210,20 +216,23 @@ func (p *Parser) ParseLine(line string) (telegraf.Metric, error) {
 			tags[k] = v
 		case STRING:
 			fields[k] = strings.Trim(v, `"`)
-		case "EPOCH":
+		case EPOCH:
 			iv, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
 				log.Printf("ERROR parsing %s to int: %s", v, err)
 			} else {
 				timestamp = time.Unix(iv, 0)
 			}
-		case "EPOCH_NANO":
+		case EPOCH_NANO:
 			iv, err := strconv.ParseInt(v, 10, 64)
 			if err != nil {
 				log.Printf("ERROR parsing %s to int: %s", v, err)
 			} else {
 				timestamp = time.Unix(0, iv)
 			}
+		case TIMESTAMP:
+			// TODO
+			log.Printf("TODO implement generic timestamp parsing %s", t)
 		case DROP:
 		// goodbye!
 		default:
@@ -267,7 +276,7 @@ func (p *Parser) compileCustomPatterns() error {
 
 	// check if pattern contains modifiers. Parse them out if it does.
 	for name, pattern := range p.patterns {
-		if typedRe.MatchString(pattern) {
+		if modifierRe.MatchString(pattern) {
 			// this pattern has modifiers, so parse out the modifiers
 			pattern, err = p.parseTypedCaptures(name, pattern)
 			if err != nil {
@@ -280,13 +289,13 @@ func (p *Parser) compileCustomPatterns() error {
 	return p.g.AddPatternsFromMap(p.patterns)
 }
 
-// parseTypedCaptures parses the capture types, and then deletes the type from
-// the line so that it is a valid "grok" pattern again.
+// parseTypedCaptures parses the capture modifiers, and then deletes the
+// modifier from the line so that it is a valid "grok" pattern again.
 //   ie,
 //     %{NUMBER:bytes:int}      => %{NUMBER:bytes}      (stores %{NUMBER}->bytes->int)
 //     %{IPORHOST:clientip:tag} => %{IPORHOST:clientip} (stores %{IPORHOST}->clientip->tag)
 func (p *Parser) parseTypedCaptures(name, pattern string) (string, error) {
-	matches := typedRe.FindAllStringSubmatch(pattern, -1)
+	matches := modifierRe.FindAllStringSubmatch(pattern, -1)
 
 	// grab the name of the capture pattern
 	patternName := "%{" + name + "}"
@@ -298,16 +307,18 @@ func (p *Parser) parseTypedCaptures(name, pattern string) (string, error) {
 	hasTimestamp := false
 	for _, match := range matches {
 		// regex capture 1 is the name of the capture
-		// regex capture 2 is the type of the capture
-		if strings.HasPrefix(match[2], "ts-") {
+		// regex capture 2 is the modifier of the capture
+		if strings.HasPrefix(match[2], "ts") {
 			if hasTimestamp {
 				return pattern, fmt.Errorf("logparser pattern compile error: "+
 					"Each pattern is allowed only one named "+
 					"timestamp data type. pattern: %s", pattern)
 			}
-			if f, ok := timeFormats[match[2]]; ok {
-				p.tsMap[patternName][match[1]] = f
+			if layout, ok := timeFormats[match[2]]; ok {
+				// built-in time format
+				p.tsMap[patternName][match[1]] = layout
 			} else {
+				// custom time format
 				p.tsMap[patternName][match[1]] = strings.TrimSuffix(strings.TrimPrefix(match[2], `ts-"`), `"`)
 			}
 			hasTimestamp = true
