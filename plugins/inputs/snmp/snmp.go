@@ -36,35 +36,32 @@ const sampleConfig = `
   #priv_protocol = ""            # Values: "DES", "AES", ""
   #priv_password = ""
 
-  ## measurement name
-  name = "system"
-  ## SNMP fields are gotten by using an "snmpget" request. If a name is not
-  ## specified, we attempt to use snmptranslate on the OID to get the MIB name.
-  [[inputs.snmp.field]]
-    name = "hostname"
+  ## Each 'tag' is an "snmpget" request. Tags are inherited by snmp walk
+  ## and get requests specified below. If a name for the tag is not provided,
+  ## we will attempt to use snmptranslate on the OID to get the MIB name.
+  [[inputs.snmp.tag]]
+    name = "hostname" # optional, tag name
     oid = ".1.2.3.0.1.1"
-  [[inputs.snmp.field]]
-    name = "uptime"
-    oid = ".1.2.3.0.1.200"
-  [[inputs.snmp.field]]
+  [[inputs.snmp.tag]]
+    name = "datacenter"
+    oid = ".1.3.6.1.2.1.1.6.0"
+
+  ## Each 'get' is an "snmpget" request. If a name for the field is not provided,
+  ## we will attempt to use snmptranslate on the OID to get the MIB name.
+  [[inputs.snmp.get]]
+    name = "hostname" # optional, field name
+    oid = ".1.2.3.0.1.1"
+  [[inputs.snmp.get]]
     oid = ".1.2.3.0.1.201"
 
-  [[inputs.snmp.table]]
-    ## measurement name
-    name = "remote_servers"
-    inherit_tags = ["hostname"]
-    ## SNMP table fields must be specified individually. If the table field has
-    ## multiple rows, they will all be gotten.
-    [[inputs.snmp.table.field]]
-      name = "server"
-      oid = ".1.2.3.0.0.0"
-      is_tag = true
-    [[inputs.snmp.table.field]]
-      name = "connections"
-      oid = ".1.2.3.0.0.1"
-    [[inputs.snmp.table.field]]
-      name = "latency"
-      oid = ".1.2.3.0.0.2"
+  ## An SNMP walk will do an "snmpwalk" from the given root OID.
+  ## Each OID it encounters will be converted into a field on the measurement.
+  ## We will attempt to use snmptranslate on the OID to get the MIB names for
+  ## each field.
+  [[inputs.snmp.walk]]
+    inherit_tags = ["hostname"] # optional, specify which top-level tags to inherit
+    name = "snmp_walk" # measurement name
+    root_oid = ".1.3.6.1.2.1.11"
 `
 
 // Snmp holds the configuration for the plugin.
@@ -94,46 +91,29 @@ type Snmp struct {
 	// Values: "DES", "AES", "". Default: ""
 	PrivProtocol string
 	PrivPassword string
-	EngineID     string
-	EngineBoots  uint32
-	EngineTime   uint32
-
-	Tables []Table `toml:"table"`
 
 	// Name & Fields are the elements of a Table.
-	// Telegraf chokes if we try to embed a Table. So instead we have to embed the
-	// fields of a Table, and construct a Table during runtime.
-	Name   string
-	Fields []Field `toml:"field"`
+	// Telegraf chokes if we try to embed a Table. So instead we have to embed
+	// the fields of a Table, and construct a Table during runtime.
+	Name  string
+	Gets  []Get  `toml:"get"`
+	Walks []Walk `toml:"walk"`
+	Tags  []Tag  `toml:"tag"`
+
+	// oidToMib is a map of OIDs to MIBs.
+	oidToMib map[string]string
+	// translateBin is the location of the 'snmptranslate' binary.
+	translateBin string
 
 	connectionCache map[string]snmpConnection
-
-	inited bool
 }
 
-// Table holds the configuration for a SNMP table.
-type Table struct {
-	// Name will be the name of the measurement.
-	Name string
-
-	// Which tags to inherit from the top-level config.
-	InheritTags []string
-
-	// Fields is the tags and values to look up.
-	Fields []Field `toml:"field"`
-}
-
-// Field holds the configuration for a Field to look up.
-type Field struct {
+// Get holds the configuration for a Get to look up.
+type Get struct {
 	// Name will be the name of the field.
 	Name string
-	// OID is prefix for this field. The plugin will perform a walk through all
-	// OIDs with this as their parent. For each value found, the plugin will strip
-	// off the OID prefix, and use the remainder as the index. For multiple fields
-	// to show up in the same row, they must share the same index.
+	// OID is prefix for this field.
 	Oid string
-	// IsTag controls whether this OID is output as a tag or a value.
-	IsTag bool
 	// Conversion controls any type conversion that is done on the value.
 	//  "float"/"float(0)" will convert the value into a float.
 	//  "float(X)" will convert the value into a float, and then move the decimal before Xth right-most digit.
@@ -141,59 +121,23 @@ type Field struct {
 	Conversion string
 }
 
-// RTable is the resulting table built from a Table.
-type RTable struct {
-	// Name is the name of the field, copied from Table.Name.
+// Walker holds the configuration for a Walker to look up.
+type Walk struct {
+	// Name will be the name of the measurement.
 	Name string
-	// Time is the time the table was built.
-	Time time.Time
-	// Rows are the rows that were found, one row for each table OID index found.
-	Rows []RTableRow
+	// OID is prefix for this field. The plugin will perform a walk through all
+	// OIDs with this as their parent. For each value found, the plugin will strip
+	// off the OID prefix, and use the remainder as the index. For multiple fields
+	// to show up in the same row, they must share the same index.
+	RootOid string
 }
 
-// RTableRow is the resulting row containing all the OID values which shared
-// the same index.
-type RTableRow struct {
-	// Tags are all the Field values which had IsTag=true.
-	Tags map[string]string
-	// Fields are all the Field values which had IsTag=false.
-	Fields map[string]interface{}
-}
-
-// Errors is a list of errors accumulated during an interval.
-type Errors []error
-
-func (errs Errors) Error() string {
-	s := ""
-	for _, err := range errs {
-		if s == "" {
-			s = err.Error()
-		} else {
-			s = s + ". " + err.Error()
-		}
-	}
-	return s
-}
-
-// NestedError wraps an error returned from deeper in the code.
-type NestedError struct {
-	// Err is the error from where the NestedError was constructed.
-	Err error
-	// NestedError is the error that was passed back from the called function.
-	NestedErr error
-}
-
-// Error returns a concatenated string of all the nested errors.
-func (ne NestedError) Error() string {
-	return ne.Err.Error() + ": " + ne.NestedErr.Error()
-}
-
-// Errorf is a convenience function for constructing a NestedError.
-func Errorf(err error, msg string, format ...interface{}) error {
-	return NestedError{
-		NestedErr: err,
-		Err:       fmt.Errorf(msg, format...),
-	}
+// Tag holds the config for a tag.
+type Tag struct {
+	// Name will be the name of the tag.
+	Name string
+	// OID is prefix for this field.
+	Oid string
 }
 
 // SampleConfig returns the default configuration of the input.
@@ -210,68 +154,106 @@ func (s *Snmp) Description() string {
 // Any error encountered does not halt the process. The errors are accumulated
 // and returned at the end.
 func (s *Snmp) Gather(acc telegraf.Accumulator) error {
-	if !s.inited {
-		s.initOidNames()
-	}
-	s.inited = true
-	var errs Errors
 	for _, agent := range s.Agents {
 		gs, err := s.getConnection(agent)
 		if err != nil {
-			errs = append(errs, Errorf(err, "agent %s", agent))
+			acc.AddError(fmt.Errorf("Agent %s, err: %s", agent, err))
 			continue
 		}
 
-		// First is the top-level fields. We treat the fields as table prefixes with an empty index.
-		t := Table{
-			Name:   s.Name,
-			Fields: s.Fields,
-		}
-		topTags := map[string]string{}
-		if err := s.gatherTable(acc, gs, t, topTags, false); err != nil {
-			errs = append(errs, Errorf(err, "agent %s", agent))
-		}
-
-		// Now is the real tables.
-		for _, t := range s.Tables {
-			if err := s.gatherTable(acc, gs, t, topTags, true); err != nil {
-				errs = append(errs, Errorf(err, "agent %s", agent))
-			}
-		}
-	}
-
-	if errs == nil {
-		return nil
-	}
-	return errs
-}
-
-// initOidNames loops through each [[inputs.snmp.field]] defined.
-// If the field doesn't have a 'name' defined, it will attempt to use
-// snmptranslate to get a name for the OID. If snmptranslate doesn't return a
-// name, or snmptranslate is not available, then use the OID as the name.
-func (s *Snmp) initOidNames() {
-	bin, _ := exec.LookPath("snmptranslate")
-
-	// Lookup names for each OID defined as a "field"
-	for i, field := range s.Fields {
-		if field.Name != "" {
-			continue
-		}
-		s.Fields[i].Name = lookupOidName(bin, field.Oid)
-	}
-
-	// Lookup names for each OID defined as a "table.field"
-	for i, table := range s.Tables {
-		for j, field := range table.Fields {
-			if field.Name != "" {
+		tags := map[string]string{}
+		// Gather all snmp tags
+		for _, t := range s.Tags {
+			tagval, err := get(gs, t.Oid, "string")
+			if err != nil {
+				acc.AddError(fmt.Errorf("Agent %s, err: %s", agent, err))
 				continue
 			}
-			s.Tables[i].Fields[j].Name = lookupOidName(bin, field.Oid)
+			if tagval == nil {
+				continue
+			}
+			name := t.Name
+			if name == "" {
+				name = s.getMibName(t.Oid)
+			}
+			if s, ok := tagval.(string); ok {
+				tags[name] = s
+			}
+		}
+
+		// Gather all snmp gets
+		fields := map[string]interface{}{}
+		for _, g := range s.Gets {
+			val, err := get(gs, g.Oid, g.Conversion)
+			if err != nil {
+				acc.AddError(fmt.Errorf("Agent %s, err: %s", agent, err))
+				continue
+			}
+			if val == nil {
+				continue
+			}
+			name := g.Name
+			if name == "" {
+				name = s.getMibName(g.Oid)
+			}
+			fields[name] = val
+		}
+		if len(fields) > 0 {
+			acc.AddFields("snmp", fields, tags, time.Now())
+		}
+
+		// Gather all snmp walks
+		for _, w := range s.Walks {
+			wfields := map[string]interface{}{}
+			s.walk(gs, wfields, w.RootOid)
+			if len(wfields) > 0 {
+				acc.AddFields(w.Name, wfields, copyTags(tags), time.Now())
+			}
 		}
 	}
+
+	return nil
 }
 
+// walk does a walk and populates the given 'fields' map with whatever it finds.
+// as it goes, it attempts to lookup the MIB name of each OID it encounters.
+func (s *Snmp) walk(
+	gs snmpConnection,
+	fields map[string]interface{},
+	oid string,
+) {
+	gs.Walk(oid, func(ent gosnmp.SnmpPDU) error {
+		name := s.getMibName(ent.Name)
+		fields[name] = ent.Value
+		return nil
+	})
+}
+
+// get simply gets the given OID and converts it to the given type.
+func get(gs snmpConnection, oid string, conv string) (interface{}, error) {
+	pkt, err := gs.Get([]string{oid})
+	if err != nil {
+		return nil, fmt.Errorf("Error performing get: %s", err)
+	}
+	if pkt != nil && len(pkt.Variables) > 0 && pkt.Variables[0].Type != gosnmp.NoSuchObject {
+		ent := pkt.Variables[0]
+		return fieldConvert(conv, ent.Value), nil
+	}
+	return nil, nil
+}
+
+func (s *Snmp) getMibName(oid string) string {
+	name, ok := s.oidToMib[oid]
+	if !ok {
+		// lookup the mib using snmptranslate
+		name = lookupOidName(s.translateBin, oid)
+		s.oidToMib[oid] = name
+	}
+	return name
+}
+
+// lookupOidName looks up the MIB name of the given OID using the provided
+// snmptranslate binary. If a name is not found, then we just return the OID.
 func lookupOidName(bin, oid string) string {
 	name := oid
 	if bin != "" {
@@ -283,126 +265,6 @@ func lookupOidName(bin, oid string) string {
 		}
 	}
 	return name
-}
-
-func (s *Snmp) gatherTable(
-	acc telegraf.Accumulator,
-	gs snmpConnection,
-	t Table,
-	topTags map[string]string,
-	walk bool,
-) error {
-	rt, err := t.Build(gs, walk)
-	if err != nil {
-		return err
-	}
-
-	for _, tr := range rt.Rows {
-		if !walk {
-			// top-level table. Add tags to topTags.
-			for k, v := range tr.Tags {
-				topTags[k] = v
-			}
-		} else {
-			// real table. Inherit any specified tags.
-			for _, k := range t.InheritTags {
-				if v, ok := topTags[k]; ok {
-					tr.Tags[k] = v
-				}
-			}
-		}
-		if _, ok := tr.Tags["agent_host"]; !ok {
-			tr.Tags["agent_host"] = gs.Host()
-		}
-		acc.AddFields(rt.Name, tr.Fields, tr.Tags, rt.Time)
-	}
-
-	return nil
-}
-
-// Build retrieves all the fields specified in the table and constructs the RTable.
-func (t Table) Build(gs snmpConnection, walk bool) (*RTable, error) {
-	rows := map[string]RTableRow{}
-
-	tagCount := 0
-	for _, f := range t.Fields {
-		if f.IsTag {
-			tagCount++
-		}
-
-		if len(f.Oid) == 0 {
-			return nil, fmt.Errorf("cannot have empty OID")
-		}
-		var oid string
-		if f.Oid[0] == '.' {
-			oid = f.Oid
-		} else {
-			// make sure OID has "." because the BulkWalkAll results do, and the prefix needs to match
-			oid = "." + f.Oid
-		}
-
-		// ifv contains a mapping of table OID index to field value
-		ifv := map[string]interface{}{}
-		if !walk {
-			// This is used when fetching non-table fields. Fields configured a the top
-			// scope of the plugin.
-			// We fetch the fields directly, and add them to ifv as if the index were an
-			// empty string. This results in all the non-table fields sharing the same
-			// index, and being added on the same row.
-			if pkt, err := gs.Get([]string{oid}); err != nil {
-				return nil, Errorf(err, "performing get")
-			} else if pkt != nil && len(pkt.Variables) > 0 && pkt.Variables[0].Type != gosnmp.NoSuchObject {
-				ent := pkt.Variables[0]
-				ifv[ent.Name[len(oid):]] = fieldConvert(f.Conversion, ent.Value)
-			}
-		} else {
-			err := gs.Walk(oid, func(ent gosnmp.SnmpPDU) error {
-				if len(ent.Name) <= len(oid) || ent.Name[:len(oid)+1] != oid+"." {
-					return NestedError{} // break the walk
-				}
-				ifv[ent.Name[len(oid):]] = fieldConvert(f.Conversion, ent.Value)
-				return nil
-			})
-			if err != nil {
-				if _, ok := err.(NestedError); !ok {
-					return nil, Errorf(err, "performing bulk walk")
-				}
-			}
-		}
-
-		for i, v := range ifv {
-			rtr, ok := rows[i]
-			if !ok {
-				rtr = RTableRow{}
-				rtr.Tags = map[string]string{}
-				rtr.Fields = map[string]interface{}{}
-				rows[i] = rtr
-			}
-			if f.IsTag {
-				if vs, ok := v.(string); ok {
-					rtr.Tags[f.Name] = vs
-				} else {
-					rtr.Tags[f.Name] = fmt.Sprintf("%v", v)
-				}
-			} else {
-				rtr.Fields[f.Name] = v
-			}
-		}
-	}
-
-	rt := RTable{
-		Name: t.Name,
-		Time: time.Now(), //TODO record time at start
-		Rows: make([]RTableRow, 0, len(rows)),
-	}
-	for _, r := range rows {
-		if len(r.Tags) < tagCount {
-			// don't add rows which are missing tags, as without tags you can't filter
-			continue
-		}
-		rt.Rows = append(rt.Rows, r)
-	}
-	return &rt, nil
 }
 
 // snmpConnection is an interface which wraps a *gosnmp.GoSNMP object.
@@ -441,7 +303,7 @@ func (gsw gosnmpWrapper) Walk(oid string, fn gosnmp.WalkFunc) error {
 			return nil
 		}
 		if err := gsw.GoSNMP.Connect(); err != nil {
-			return Errorf(err, "reconnecting")
+			return fmt.Errorf("reconnecting %s", err)
 		}
 	}
 	return err
@@ -458,7 +320,7 @@ func (gsw gosnmpWrapper) Get(oids []string) (*gosnmp.SnmpPacket, error) {
 			return pkt, nil
 		}
 		if err := gsw.GoSNMP.Connect(); err != nil {
-			return nil, Errorf(err, "reconnecting")
+			return nil, fmt.Errorf("reconnecting %s", err)
 		}
 	}
 	return nil, err
@@ -479,7 +341,7 @@ func (s *Snmp) getConnection(agent string) (snmpConnection, error) {
 	host, portStr, err := net.SplitHostPort(agent)
 	if err != nil {
 		if err, ok := err.(*net.AddrError); !ok || err.Err != "missing port in address" {
-			return nil, Errorf(err, "parsing host")
+			return nil, fmt.Errorf("reconnecting %s", err)
 		}
 		host = agent
 		portStr = "161"
@@ -488,13 +350,13 @@ func (s *Snmp) getConnection(agent string) (snmpConnection, error) {
 
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return nil, Errorf(err, "parsing port")
+		return nil, fmt.Errorf("reconnecting %s", err)
 	}
 	gs.Port = uint16(port)
 
 	if s.Timeout != "" {
 		if gs.Timeout, err = time.ParseDuration(s.Timeout); err != nil {
-			return nil, Errorf(err, "parsing timeout")
+			return nil, fmt.Errorf("reconnecting %s", err)
 		}
 	} else {
 		gs.Timeout = time.Second * 1
@@ -568,16 +430,10 @@ func (s *Snmp) getConnection(agent string) (snmpConnection, error) {
 		}
 
 		sp.PrivacyPassphrase = s.PrivPassword
-
-		sp.AuthoritativeEngineID = s.EngineID
-
-		sp.AuthoritativeEngineBoots = s.EngineBoots
-
-		sp.AuthoritativeEngineTime = s.EngineTime
 	}
 
 	if err := gs.Connect(); err != nil {
-		return nil, Errorf(err, "setting up connection")
+		return nil, fmt.Errorf("setting up connection %s", err)
 	}
 
 	s.connectionCache[agent] = gs
@@ -588,14 +444,18 @@ func (s *Snmp) getConnection(agent string) (snmpConnection, error) {
 //  "float"/"float(0)" will convert the value into a float.
 //  "float(X)" will convert the value into a float, and then move the decimal before Xth right-most digit.
 //  "int" will convert the value into an integer.
-//  "" will convert a byte slice into a string.
+//  "string" will convert any interface to a string.
 // Any other conv will return the input value unchanged.
 func fieldConvert(conv string, v interface{}) interface{} {
-	if conv == "" {
-		if bs, ok := v.([]byte); ok {
-			return string(bs)
+	if conv == "string" {
+		switch vt := v.(type) {
+		case []byte:
+			v = string(vt)
+		case int:
+			v = strconv.Itoa(vt)
+		default:
+			v = fmt.Sprint(v)
 		}
-		return v
 	}
 
 	var d int
@@ -669,11 +529,22 @@ func fieldConvert(conv string, v interface{}) interface{} {
 	return v
 }
 
+func copyTags(in map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func init() {
+	bin, _ := exec.LookPath("snmptranslate")
 	inputs.Add("snmp", func() telegraf.Input {
 		return &Snmp{
 			Retries:        5,
 			MaxRepetitions: 50,
+			translateBin:   bin,
+			oidToMib:       make(map[string]string),
 		}
 	})
 }
